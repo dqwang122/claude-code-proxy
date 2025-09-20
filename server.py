@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 import logging
 import json
+import asyncio
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
@@ -18,9 +19,17 @@ import sys
 # Load environment variables from .env file
 load_dotenv()
 
+
+# Basic LiteLLM Configuration - conservative settings to avoid hanging
+litellm.drop_params = True
+litellm.set_verbose = False
+litellm.request_timeout = 90
+
+
+
 # Configure logging
 logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
+    level=logging.INFO,  # Change to INFO level to show more details
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
@@ -45,9 +54,7 @@ class MessageFilter(logging.Filter):
         ]
         
         if hasattr(record, 'msg') and isinstance(record.msg, str):
-            for phrase in blocked_phrases:
-                if phrase in record.msg:
-                    return False
+            return not any(phrase in record.msg for phrase in blocked_phrases)
         return True
 
 # Apply the filter to the root logger to catch all messages
@@ -112,7 +119,9 @@ OPENAI_MODELS = [
 # List of Gemini models
 GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.5-pro"
+    "gemini-2.5-pro",
+    "gemini-2.5-pro-preview-03-25",
+    "gemini-2.0-flash"
 ]
 
 # Helper function to clean schema for Gemini
@@ -364,35 +373,30 @@ async def log_requests(request: Request, call_next):
 # Not using validation function as we're using the environment API key
 
 def parse_tool_result_content(content):
-    """Helper function to properly parse and normalize tool result content."""
+    """Parse and normalize tool result content into a string format."""
     if content is None:
         return "No content provided"
-        
+
     if isinstance(content, str):
         return content
-        
+
     if isinstance(content, list):
-        result = ""
+        result_parts = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
-                result += item.get("text", "") + "\n"
+                result_parts.append(item.get("text", ""))
             elif isinstance(item, str):
-                result += item + "\n"
+                result_parts.append(item)
             elif isinstance(item, dict):
                 if "text" in item:
-                    result += item.get("text", "") + "\n"
+                    result_parts.append(item.get("text", ""))
                 else:
                     try:
-                        result += json.dumps(item) + "\n"
+                        result_parts.append(json.dumps(item))
                     except:
-                        result += str(item) + "\n"
-            else:
-                try:
-                    result += str(item) + "\n"
-                except:
-                    result += "Unparseable content\n"
-        return result.strip()
-        
+                        result_parts.append(str(item))
+        return "\n".join(result_parts).strip()
+
     if isinstance(content, dict):
         if content.get("type") == "text":
             return content.get("text", "")
@@ -400,8 +404,7 @@ def parse_tool_result_content(content):
             return json.dumps(content)
         except:
             return str(content)
-            
-    # Fallback for any other type
+
     try:
         return str(content)
     except:
@@ -433,130 +436,135 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 messages.append({"role": "system", "content": system_text.strip()})
     
     # Add conversation messages
-    for idx, msg in enumerate(anthropic_request.messages):
-        content = msg.content
-        if isinstance(content, str):
-            messages.append({"role": msg.role, "content": content})
-        else:
-            # Special handling for tool_result in user messages
-            # OpenAI/LiteLLM format expects the assistant to call the tool, 
-            # and the user's next message to include the result as plain text
-            if msg.role == "user" and any(block.type == "tool_result" for block in content if hasattr(block, "type")):
-                # For user messages with tool_result, split into separate messages
-                text_content = ""
+    for msg in anthropic_request.messages:
+        if isinstance(msg.content, str):
+            messages.append({"role": msg.role, "content": msg.content})
+            continue
+
+        # Process content blocks - accumulate different types
+        text_parts = []
+        image_parts = []
+        tool_calls = []
+        pending_tool_messages = []
+
+        for block in msg.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "image":
+                if (isinstance(block.source, dict) and 
+                    block.source.get("type") == "base64" and
+                    "media_type" in block.source and "data" in block.source):
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{block.source['media_type']};base64,{block.source['data']}"
+                        }
+                    })
+            elif block.type == "tool_use" and msg.role == "assistant":
+                tool_calls.append({
+                    "id": block.id,
+                    "type": "function",
+                    "function": {
+                        "name": block.name,
+                        "arguments": json.dumps(block.input)
+                    }
+                })
+            elif block.type == "tool_result" and msg.role == "user":
+                # CRITICAL: Split user message when tool_result is encountered
+                if text_parts or image_parts:
+                    content_parts = []
+                    text_content = "".join(text_parts).strip()
+                    if text_content:
+                        content_parts.append({"type": "text", "text": text_content})
+                    content_parts.extend(image_parts)
+                    
+                    messages.append({
+                        "role": "user",
+                        "content": content_parts[0]["text"] if len(content_parts) == 1 and content_parts[0]["type"] == "text" else content_parts
+                    })
+                    text_parts.clear()
+                    image_parts.clear()
+
+                # Add tool result as separate "tool" role message
+                parsed_content = parse_tool_result_content(block.content)
+                pending_tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.tool_use_id,
+                    "content": parsed_content
+                })
+
+        # Finalize message based on role
+        if msg.role == "user":
+            # Add any remaining text/image content
+            if text_parts or image_parts:
+                content_parts = []
+                text_content = "".join(text_parts).strip()
+                if text_content:
+                    content_parts.append({"type": "text", "text": text_content})
+                content_parts.extend(image_parts)
                 
-                # Extract all text parts and concatenate them
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            text_content += block.text + "\n"
-                        elif block.type == "tool_result":
-                            # Add tool result as a message by itself - simulate the normal flow
-                            tool_id = block.tool_use_id if hasattr(block, "tool_use_id") else ""
-                            
-                            # Handle different formats of tool result content
-                            result_content = ""
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    result_content = block.content
-                                elif isinstance(block.content, list):
-                                    # If content is a list of blocks, extract text from each
-                                    for content_block in block.content:
-                                        if hasattr(content_block, "type") and content_block.type == "text":
-                                            result_content += content_block.text + "\n"
-                                        elif isinstance(content_block, dict) and content_block.get("type") == "text":
-                                            result_content += content_block.get("text", "") + "\n"
-                                        elif isinstance(content_block, dict):
-                                            # Handle any dict by trying to extract text or convert to JSON
-                                            if "text" in content_block:
-                                                result_content += content_block.get("text", "") + "\n"
-                                            else:
-                                                try:
-                                                    result_content += json.dumps(content_block) + "\n"
-                                                except:
-                                                    result_content += str(content_block) + "\n"
-                                elif isinstance(block.content, dict):
-                                    # Handle dictionary content
-                                    if block.content.get("type") == "text":
-                                        result_content = block.content.get("text", "")
-                                    else:
-                                        try:
-                                            result_content = json.dumps(block.content)
-                                        except:
-                                            result_content = str(block.content)
-                                else:
-                                    # Handle any other type by converting to string
-                                    try:
-                                        result_content = str(block.content)
-                                    except:
-                                        result_content = "Unparseable content"
-                            
-                            # In OpenAI format, tool results come from the user (rather than being content blocks)
-                            text_content += f"Tool result for {tool_id}:\n{result_content}\n"
+                messages.append({
+                    "role": "user",
+                    "content": content_parts[0]["text"] if len(content_parts) == 1 and content_parts[0]["type"] == "text" else content_parts
+                })
+            # Add any pending tool messages
+            messages.extend(pending_tool_messages)
+            
+        elif msg.role == "assistant":
+            assistant_msg = {"role": "assistant"}
+            
+            # Handle content for assistant messages
+            content_parts = []
+            text_content = "".join(text_parts).strip()
+            if text_content:
+                content_parts.append({"type": "text", "text": text_content})
+            content_parts.extend(image_parts)
+            
+            # Set content only if we have actual content parts
+            if content_parts:
+                assistant_msg["content"] = content_parts[0]["text"] if len(content_parts) == 1 and content_parts[0]["type"] == "text" else content_parts
+            # Don't set content at all if there are no content parts - let the API handle it
                 
-                # Add as a single user message with all the content
-                messages.append({"role": "user", "content": text_content.strip()})
-            else:
-                # Regular handling for other message types
-                processed_content = []
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            processed_content.append({"type": "text", "text": block.text})
-                        elif block.type == "image":
-                            processed_content.append({"type": "image", "source": block.source})
-                        elif block.type == "tool_use":
-                            # Handle tool use blocks if needed
-                            processed_content.append({
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": block.input
-                            })
-                        elif block.type == "tool_result":
-                            # Handle different formats of tool result content
-                            processed_content_block = {
-                                "type": "tool_result",
-                                "tool_use_id": block.tool_use_id if hasattr(block, "tool_use_id") else ""
-                            }
-                            
-                            # Process the content field properly
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    # If it's a simple string, create a text block for it
-                                    processed_content_block["content"] = [{"type": "text", "text": block.content}]
-                                elif isinstance(block.content, list):
-                                    # If it's already a list of blocks, keep it
-                                    processed_content_block["content"] = block.content
-                                else:
-                                    # Default fallback
-                                    processed_content_block["content"] = [{"type": "text", "text": str(block.content)}]
-                            else:
-                                # Default empty content
-                                processed_content_block["content"] = [{"type": "text", "text": ""}]
-                                
-                            processed_content.append(processed_content_block)
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
                 
-                messages.append({"role": msg.role, "content": processed_content})
-    
+            # Only add message if it has actual content or tool calls
+            # Check for content existence more carefully
+            has_content = "content" in assistant_msg and assistant_msg["content"] is not None
+            has_tool_calls = "tool_calls" in assistant_msg and assistant_msg["tool_calls"]
+            
+            if has_content or has_tool_calls:
+                messages.append(assistant_msg)
+
+
     # Cap max_tokens for OpenAI models to their limit of 16384
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
-        max_tokens = min(max_tokens, 16384)
-        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
+    # if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
+    #     max_tokens = min(max_tokens, 16384)
+    #     logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
+    print(f"Max tokens: {max_tokens}")
     
     # Create LiteLLM request dict
     litellm_request = {
         "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_tokens": min(anthropic_request.max_tokens, 8192),
         "temperature": anthropic_request.temperature,
         "stream": anthropic_request.stream,
+        "stream_options": {"include_usage": True},
     }
+
+
+    # print(f"LiteLLM request: {litellm_request}")
+    # print(f"Anthropic request: {anthropic_request}")
 
     # Only include thinking field for Anthropic models
     if anthropic_request.thinking and anthropic_request.model.startswith("anthropic/"):
         litellm_request["thinking"] = anthropic_request.thinking
+
+    # also include thinking field for Gemini models
+    if anthropic_request.thinking and anthropic_request.model.startswith("gemini/"):
+        litellm_request["thinking"] = {"type": "enabled", "budget_tokens": 32000}
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -688,7 +696,7 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             content.append({"type": "text", "text": content_text})
         
         # Add tool calls if present (tool_use in Anthropic format) - only for Claude models
-        if tool_calls and is_claude_model:
+        if tool_calls:
             logger.debug(f"Processing tool calls: {tool_calls}")
             
             # Convert to list if it's not already
@@ -696,78 +704,43 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                 tool_calls = [tool_calls]
                 
             for idx, tool_call in enumerate(tool_calls):
-                logger.debug(f"Processing tool call {idx}: {tool_call}")
-                
-                # Extract function data based on whether it's a dict or object
-                if isinstance(tool_call, dict):
-                    function = tool_call.get("function", {})
-                    tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
-                    name = function.get("name", "")
-                    arguments = function.get("arguments", "{}")
-                else:
-                    function = getattr(tool_call, "function", None)
-                    tool_id = getattr(tool_call, "id", f"tool_{uuid.uuid4()}")
-                    name = getattr(function, "name", "") if function else ""
-                    arguments = getattr(function, "arguments", "{}") if function else "{}"
-                
-                # Convert string arguments to dict if needed
-                if isinstance(arguments, str):
+                try:
+                    logger.debug(f"Processing tool call {idx}: {tool_call}")
+                    
+                    # Extract function data based on whether it's a dict or object
+                    if isinstance(tool_call, dict):
+                        function = tool_call.get("function", {})
+                        tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
+                        name = function.get("name", "")
+                        arguments_str = function.get("arguments", "{}")
+                    elif hasattr(tool_call, "id") and hasattr(tool_call, "function"):
+                        tool_id = tool_call.id
+                        name = tool_call.function.name
+                        arguments_str = tool_call.function.arguments
+                    else:
+                        continue
+
+                    if not name:
+                        continue
+
+                    # Parse tool arguments safely
                     try:
-                        arguments = json.loads(arguments)
+                        arguments_dict = json.loads(arguments_str)
                     except json.JSONDecodeError:
-                        logger.warning(f"Failed to parse tool arguments as JSON: {arguments}")
-                        arguments = {"raw": arguments}
-                
-                logger.debug(f"Adding tool_use block: id={tool_id}, name={name}, input={arguments}")
-                
-                content.append({
-                    "type": "tool_use",
-                    "id": tool_id,
-                    "name": name,
-                    "input": arguments
-                })
-        elif tool_calls and not is_claude_model:
-            # For non-Claude models, convert tool calls to text format
-            logger.debug(f"Converting tool calls to text for non-Claude model: {clean_model}")
-            
-            # We'll append tool info to the text content
-            tool_text = "\n\nTool usage:\n"
-            
-            # Convert to list if it's not already
-            if not isinstance(tool_calls, list):
-                tool_calls = [tool_calls]
-                
-            for idx, tool_call in enumerate(tool_calls):
-                # Extract function data based on whether it's a dict or object
-                if isinstance(tool_call, dict):
-                    function = tool_call.get("function", {})
-                    tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
-                    name = function.get("name", "")
-                    arguments = function.get("arguments", "{}")
-                else:
-                    function = getattr(tool_call, "function", None)
-                    tool_id = getattr(tool_call, "id", f"tool_{uuid.uuid4()}")
-                    name = getattr(function, "name", "") if function else ""
-                    arguments = getattr(function, "arguments", "{}") if function else "{}"
-                
-                # Convert string arguments to dict if needed
-                if isinstance(arguments, str):
-                    try:
-                        args_dict = json.loads(arguments)
-                        arguments_str = json.dumps(args_dict, indent=2)
-                    except json.JSONDecodeError:
-                        arguments_str = arguments
-                else:
-                    arguments_str = json.dumps(arguments, indent=2)
-                
-                tool_text += f"Tool: {name}\nArguments: {arguments_str}\n\n"
-            
-            # Add or append tool text to content
-            if content and content[0]["type"] == "text":
-                content[0]["text"] += tool_text
-            else:
-                content.append({"type": "text", "text": tool_text})
-        
+                        arguments_dict = {"raw_arguments": arguments_str}
+                    
+                    logger.debug(f"Adding tool_use block: id={tool_id}, name={name}, input={arguments_dict}")
+                    
+                    content.append({
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": name,
+                        "input": arguments_dict
+                    })
+                except Exception as e:
+                        logger.warning(f"Error processing tool call: {e}")
+                        continue
+
         # Get usage information - extract values safely from object or dict
         if isinstance(usage_info, dict):
             prompt_tokens = usage_info.get("prompt_tokens", 0)
@@ -866,59 +839,228 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         has_sent_stop_reason = False
         last_tool_index = 0
         
-        # Process each chunk
-        async for chunk in response_generator:
-            try:
-
+        # Enhanced error recovery tracking
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        stream_terminated_early = False
+        malformed_chunks_count = 0
+        max_malformed_chunks = 20
+        
+        # Buffer for incomplete chunks
+        chunk_buffer = ""
+        
+        def is_malformed_chunk(chunk_str: str) -> bool:
+            """Enhanced malformed chunk detection."""
+            if not chunk_str or not isinstance(chunk_str, str):
+                return True
                 
-                # Check if this is the end of the response with usage data
-                if hasattr(chunk, 'usage') and chunk.usage is not None:
-                    if hasattr(chunk.usage, 'prompt_tokens'):
-                        input_tokens = chunk.usage.prompt_tokens
-                    if hasattr(chunk.usage, 'completion_tokens'):
-                        output_tokens = chunk.usage.completion_tokens
+            chunk_stripped = chunk_str.strip()
+            
+            # Empty or whitespace
+            if not chunk_stripped:
+                return True
                 
-                # Handle text content
-                if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                    choice = chunk.choices[0]
+            # Single characters that indicate malformed JSON
+            malformed_singles = ["{", "}", "[", "]", ",", ":", '"', "'"]
+            if chunk_stripped in malformed_singles:
+                return True
+                
+            # Common malformed patterns
+            malformed_patterns = [
+                '{"', '"}', "[{", "}]", "{}", "[]", 
+                "null", '""', "''", " ", "",
+                "{,", ",}", "[,", ",]"
+            ]
+            if chunk_stripped in malformed_patterns:
+                return True
+                
+            # Incomplete JSON structures
+            if chunk_stripped.startswith('{') and not chunk_stripped.endswith('}'):
+                if len(chunk_stripped) < 15:  # Very short incomplete JSON
+                    return True
                     
-                    # Get the delta from the choice
-                    if hasattr(choice, 'delta'):
-                        delta = choice.delta
+            if chunk_stripped.startswith('[') and not chunk_stripped.endswith(']'):
+                if len(chunk_stripped) < 10:
+                    return True
+            
+            # Check for obviously broken JSON patterns
+            if chunk_stripped.count('{') != chunk_stripped.count('}'):
+                if len(chunk_stripped) < 20:  # Only for short chunks
+                    return True
+                    
+            if chunk_stripped.count('[') != chunk_stripped.count(']'):
+                if len(chunk_stripped) < 20:
+                    return True
+            
+            return False
+        
+        def try_parse_buffered_chunk(buffer: str) -> tuple[dict, str]:
+            """Try to parse buffered chunks, return parsed chunk and remaining buffer."""
+            if not buffer.strip():
+                return None, ""
+                
+            # Try to find complete JSON objects in the buffer
+            brace_count = 0
+            start_pos = -1
+            
+            for i, char in enumerate(buffer):
+                if char == '{':
+                    if start_pos == -1:
+                        start_pos = i
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_pos != -1:
+                        # Found complete JSON object
+                        json_str = buffer[start_pos:i+1]
+                        try:
+                            parsed = json.loads(json_str)
+                            remaining_buffer = buffer[i+1:]
+                            return parsed, remaining_buffer
+                        except json.JSONDecodeError:
+                            continue
+            
+            # No complete JSON found
+            return None, buffer
+        
+        # Enhanced streaming with comprehensive error handling
+        try:
+            # Wrap the entire streaming process in comprehensive error handling
+            stream_iterator = aiter(response_generator)
+            
+            while True:
+                try:
+                    # Get next chunk with timeout
+                    try:
+                        chunk = await asyncio.wait_for(anext(stream_iterator), timeout=90.0)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning("Streaming timeout, terminating")
+                        stream_terminated_early = True
+                        break
+                    
+                    # Reset consecutive error counter on successful chunk retrieval
+                    consecutive_errors = 0
+                    
+                    # Handle string chunks with enhanced validation
+                    if isinstance(chunk, str):
+                        if chunk.strip() == "[DONE]":
+                            break
+                        
+                        # Check for malformed chunks
+                        if is_malformed_chunk(chunk):
+                            malformed_chunks_count += 1
+                            logger.debug(f"Skipping malformed chunk #{malformed_chunks_count}: '{chunk[:50]}{'...' if len(chunk) > 50 else ''}'")
+                            
+                            if malformed_chunks_count > max_malformed_chunks:
+                                logger.error(f"Too many malformed chunks ({malformed_chunks_count}), terminating stream")
+                                stream_terminated_early = True
+                                break
+                            continue
+                        
+                        # Add to buffer and try to parse
+                        chunk_buffer += chunk
+                        parsed_chunk, chunk_buffer = try_parse_buffered_chunk(chunk_buffer)
+                        
+                        if parsed_chunk is None:
+                            # Keep buffering if we don't have a complete chunk yet
+                            if len(chunk_buffer) > 10000:  # Prevent buffer from growing too large
+                                logger.warning("Chunk buffer too large, clearing")
+                                chunk_buffer = ""
+                            continue
+                        
+                        chunk = parsed_chunk
+                    
+                    # If we have a dictionary at this point, process it
+                    if isinstance(chunk, dict):
+                        # Process the chunk normally (existing logic)
+                        pass
+                    elif hasattr(chunk, 'choices'):
+                        # Process ModelResponse object normally (existing logic)
+                        pass
                     else:
-                        # If no delta, try to get message
-                        delta = getattr(choice, 'message', {})
+                        # Try one more JSON parse attempt
+                        try:
+                            if isinstance(chunk, str):
+                                chunk = json.loads(chunk)
+                            else:
+                                logger.debug(f"Skipping unprocessable chunk type: {type(chunk)}")
+                                continue
+                        except json.JSONDecodeError as parse_error:
+                            logger.debug(f"Failed to parse chunk as JSON: {parse_error}")
+                            continue
+
+                    # Process chunk data (existing logic)
+                    delta_content_text = None
+                    delta_tool_calls = None
+                    chunk_finish_reason = None
+
+                    # Check if this is the end of the response with usage data
+                    if hasattr(chunk, 'usage') and chunk.usage is not None:
+                        if hasattr(chunk.usage, 'prompt_tokens'):
+                            input_tokens = chunk.usage.prompt_tokens
+                        if hasattr(chunk.usage, 'completion_tokens'):
+                            output_tokens = chunk.usage.completion_tokens
                     
-                    # Check for finish_reason to know when we're done
-                    finish_reason = getattr(choice, 'finish_reason', None)
+                    # Handle text content
+                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                        choice = chunk.choices[0]
+                        
+                        # Get the delta from the choice
+                        if hasattr(choice, 'delta'):
+                            delta = choice.delta
+                        else:
+                            # If no delta, try to get message
+                            delta = getattr(choice, 'message', {})
+                        
+                        # Check for finish_reason to know when we're done
+                        chunk_finish_reason = getattr(choice, 'finish_reason', None)
+                        
+                        # Process text content
+                        delta_content_text = None
+                        
+                        # Handle different formats of delta content
+                        if hasattr(delta, 'content'):
+                            delta_content_text = delta.content
+                        elif isinstance(delta, dict) and 'content' in delta:
+                            delta_content_text = delta['content']
+                        
+                        # Process tool calls
+                        delta_tool_calls = None
+                        
+                        # Handle different formats of tool calls
+                        if hasattr(delta, 'tool_calls'):
+                            delta_tool_calls = delta.tool_calls
+                        elif isinstance(delta, dict) and 'tool_calls' in delta:
+                            delta_tool_calls = delta['tool_calls']
                     
-                    # Process text content
-                    delta_content = None
-                    
-                    # Handle different formats of delta content
-                    if hasattr(delta, 'content'):
-                        delta_content = delta.content
-                    elif isinstance(delta, dict) and 'content' in delta:
-                        delta_content = delta['content']
-                    
-                    # Accumulate text content
-                    if delta_content is not None and delta_content != "":
-                        accumulated_text += delta_content
+                    elif isinstance(chunk, dict):
+                        choices = chunk.get("choices", [])
+                        if choices:
+                            choice = choices[0]
+                            delta = choice.get("delta", {})
+                            delta_content_text = delta.get("content")
+                            delta_tool_calls = delta.get("tool_calls")
+                            chunk_finish_reason = choice.get("finish_reason")
+
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        input_tokens += getattr(chunk.usage, 'prompt_tokens', 0)
+                        output_tokens += getattr(chunk.usage, 'completion_tokens', 0)
+                    elif isinstance(chunk, dict) and "usage" in chunk:
+                        usage = chunk["usage"]
+                        input_tokens += usage.get("prompt_tokens", 0)
+                        output_tokens += usage.get("completion_tokens", 0)
+
+                    # Handle text delta
+                    if delta_content_text:
+                        accumulated_text += delta_content_text
                         
                         # Always emit text deltas if no tool calls started
                         if tool_index is None and not text_block_closed:
                             text_sent = True
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
-                    
-                    # Process tool calls
-                    delta_tool_calls = None
-                    
-                    # Handle different formats of tool calls
-                    if hasattr(delta, 'tool_calls'):
-                        delta_tool_calls = delta.tool_calls
-                    elif isinstance(delta, dict) and 'tool_calls' in delta:
-                        delta_tool_calls = delta['tool_calls']
-                    
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content_text}})}\n\n"
+
                     # Process tool calls if any
                     if delta_tool_calls:
                         # First tool call we've seen - need to handle text properly
@@ -1008,7 +1150,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
                     
                     # Process finish_reason - end the streaming response
-                    if finish_reason and not has_sent_stop_reason:
+                    if chunk_finish_reason and not has_sent_stop_reason:
                         has_sent_stop_reason = True
                         
                         # Close any open tool call blocks
@@ -1026,11 +1168,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         
                         # Map OpenAI finish_reason to Anthropic stop_reason
                         stop_reason = "end_turn"
-                        if finish_reason == "length":
+                        if chunk_finish_reason == "length":
                             stop_reason = "max_tokens"
-                        elif finish_reason == "tool_calls":
+                        elif chunk_finish_reason == "tool_calls":
                             stop_reason = "tool_use"
-                        elif finish_reason == "stop":
+                        elif chunk_finish_reason == "stop":
                             stop_reason = "end_turn"
                         
                         # Send message_delta with stop reason and usage
@@ -1044,13 +1186,64 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         # Send final [DONE] marker to match Anthropic's behavior
                         yield "data: [DONE]\n\n"
                         return
-            except Exception as e:
-                # Log error but continue processing other chunks
-                logger.error(f"Error processing chunk: {str(e)}")
-                continue
+                        
+                except (json.JSONDecodeError, ValueError) as parse_error:
+                    consecutive_errors += 1
+                    logger.debug(f"JSON parsing error (attempt {consecutive_errors}/{max_consecutive_errors}): {parse_error}")
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(f"Too many consecutive parsing errors ({consecutive_errors}), terminating stream")
+                        stream_terminated_early = True
+                        break
+                    continue
+                    
+                except (litellm.exceptions.APIConnectionError, RuntimeError) as api_error:
+                    consecutive_errors += 1
+                    error_msg = str(api_error)
+                    
+                    # Check for the specific malformed chunk error
+                    if ("Error parsing chunk" in error_msg and 
+                        "Expecting property name enclosed in double quotes" in error_msg):
+                        
+                        logger.warning(f"Malformed chunk error (attempt {consecutive_errors}/{max_consecutive_errors})")
+                        
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.error(f"Too many consecutive API errors ({consecutive_errors}), terminating stream")
+                            stream_terminated_early = True
+                            
+                            # Send error info to client
+                            error_text = f"\n⚠️ Streaming encountered repeated malformed chunks. This is a known API issue.\n"
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': error_text}})}\n\n"
+                            break
+                        
+                        # Brief delay before continuing
+                        await asyncio.sleep(0.1)
+                        continue
+                    else:
+                        # Other API errors - terminate immediately
+                        logger.error(f"API error: {api_error}")
+                        stream_terminated_early = True
+                        break
+                        
+                except Exception as general_error:
+                    consecutive_errors += 1
+                    logger.error(f"Unexpected streaming error (attempt {consecutive_errors}/{max_consecutive_errors}): {general_error}")
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(f"Too many consecutive errors ({consecutive_errors}), terminating stream")
+                        stream_terminated_early = True
+                        break
+                    
+                    # Brief delay before continuing
+                    await asyncio.sleep(0.1)
+                    continue
+
+        except Exception as outer_error:
+            logger.error(f"Fatal streaming error: {outer_error}")
+            stream_terminated_early = True
         
-        # If we didn't get a finish reason, close any open blocks
-        if not has_sent_stop_reason:
+        # Always send final SSE events
+        try:
             # Close any open tool call blocks
             if tool_index is not None:
                 for i in range(1, last_tool_index + 1):
@@ -1059,16 +1252,31 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             # Close the text content block
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
             
+            # Determine final stop reason
+            if stream_terminated_early and not has_sent_stop_reason:
+                final_stop_reason = "error"
+            elif not has_sent_stop_reason:
+                final_stop_reason = "end_turn"
+            else:
+                final_stop_reason = "end_turn"
+            
             # Send final message_delta with usage
             usage = {"output_tokens": output_tokens}
             
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
+            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': final_stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
             
             # Send message_stop event
             yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             
             # Send final [DONE] marker to match Anthropic's behavior
             yield "data: [DONE]\n\n"
+            
+            # Log final statistics
+            if malformed_chunks_count > 0:
+                logger.info(f"Stream completed with {malformed_chunks_count} malformed chunks handled")
+                
+        except Exception as final_error:
+            logger.error(f"Error sending final SSE events: {final_error}")
     
     except Exception as e:
         import traceback
@@ -1114,6 +1322,8 @@ async def create_message(
         
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
+        # print(f"Sending to LiteLLM: {litellm_request.get('messages')}")
+
         
         # Determine which API key to use based on the model
         if request.model.startswith("openai/"):
@@ -1270,7 +1480,7 @@ async def create_message(
                     litellm_request["messages"][i]["content"] = "..." # Fallback placeholder
         
         # Only log basic info about the request, not the full details
-        logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
+        logger.info(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
         
         # Handle streaming mode
         if request.stream:
@@ -1288,6 +1498,7 @@ async def create_message(
             )
             # Ensure we use the async version for streaming
             response_generator = await litellm.acompletion(**litellm_request)
+            logger.info(f"✅ RESPONSE GENERATOR: {response_generator}")
             
             return StreamingResponse(
                 handle_streaming(response_generator, request),
@@ -1308,10 +1519,12 @@ async def create_message(
             )
             start_time = time.time()
             litellm_response = litellm.completion(**litellm_request)
-            logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
+            logger.info(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
             
             # Convert LiteLLM response to Anthropic format
             anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+        
+            
             
             return anthropic_response
                 
@@ -1494,8 +1707,8 @@ def log_request_beautifully(method, path, claude_model, openai_model, num_messag
     model_line = f"{claude_display} → {openai_display} {tools_str} {messages_str}"
     
     # Print to console
-    print(log_line)
-    print(model_line)
+    logger.info(log_line)
+    logger.info(model_line)
     sys.stdout.flush()
 
 if __name__ == "__main__":
